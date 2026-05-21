@@ -1,9 +1,14 @@
+// ============================================================
+//  EMPIRE BOT-WAN (PROTOTYPE) — index.js
+//  Owner-only WhatsApp bot with pairing code + public pairing portal
+// ============================================================
+
 import { default as makeWASocket, useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
 import pino from 'pino';
 
-// ====== IMPORTS ======
+// ====== COMMAND IMPORTS ======
 import {
   cmdPing, cmdHelp, cmdList, cmdMenu, cmdProfile,
   cmdViewOnce, cmdSend,
@@ -17,6 +22,7 @@ import {
   cmdContactExport, cmdContactAutoGroup, cmdContactHelp
 } from './commands/index.js';
 
+// ====== UTILITY IMPORTS ======
 import {
   PREFIX, OWNER_NUMBER, BOT_NAME, randomEmoji, isOwner
 } from './utils/helpers.js';
@@ -29,12 +35,18 @@ import {
 
 import { autoSaveContact } from './utils/contacts.js';
 
-// ====== PAIRING CODE (Option 1 — no QR scan needed) ======
+// ====== PAIRING / WELCOME / PUBLIC PAIR ======
 import { setupPairing } from './lib/pairing.js';
+import { sendBootSuccess } from './lib/welcome.js';
+import { handlePublicPairRequest } from './lib/publicPair.js';
+import { cmdPair } from './commands/pair.js';
 
-// ====== MAIN ======
+// ============================================================
+//  MAIN START
+// ============================================================
 async function startBot() {
   console.log('⏳ Starting ' + BOT_NAME + '...');
+
   const { state, saveCreds } = await useMultiFileAuthState('auth_info');
 
   const sock = makeWASocket({
@@ -46,24 +58,34 @@ async function startBot() {
     shouldIgnoreJid: () => false,
   });
 
-  // ====== PAIRING CODE — fires only if not yet authenticated ======
+  // ====== PAIRING CODE — only runs on first launch ======
   if (!state.creds.registered) {
     setupPairing(sock, OWNER_NUMBER).catch(e => console.error('pairing error:', e.message));
   }
 
+  // ====== CONNECTION HANDLER ======
   sock.ev.on('connection.update', (u) => {
     const { connection, lastDisconnect, qr } = u;
+
     if (qr) {
       console.log(String.fromCharCode(10) + '📱 Scan this QR (WhatsApp → Linked Devices):' + String.fromCharCode(10));
       qrcode.generate(qr, { small: true });
     }
-    if (connection === 'connecting') console.log('🔌 Connecting...');
+
+    if (connection === 'connecting') {
+      console.log('🔌 Connecting...');
+    }
+
     if (connection === 'open') {
       console.log('✅ ' + BOT_NAME + ' is ONLINE');
       console.log('   Bot JID: ' + sock.user?.id);
       console.log('   Owner:   ' + OWNER_NUMBER);
       console.log('   Listening for commands with prefix: ' + PREFIX);
+
+      // Owner success DM (fires once per process)
+      sendBootSuccess(sock).catch(e => console.error('boot dm:', e.message));
     }
+
     if (connection === 'close') {
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
       const reconnect = code !== DisconnectReason.loggedOut;
@@ -76,6 +98,7 @@ async function startBot() {
   sock.ev.on('groups.update', (us) => us.forEach(u => u.id && invalidateGroup(u.id)));
   sock.ev.on('group-participants.update', (e) => invalidateGroup(e.id));
 
+  // ====== MESSAGE DISPATCHER ======
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
     for (const msg of messages) {
@@ -86,6 +109,9 @@ async function startBot() {
   console.log('✅ Event listeners registered.');
 }
 
+// ============================================================
+//  MESSAGE HANDLER
+// ============================================================
 async function handleMessage(sock, msg) {
   if (!msg.message) return;
 
@@ -111,13 +137,14 @@ async function handleMessage(sock, msg) {
     msg.message.videoMessage?.caption ||
     '';
 
+  // ===== LOG INCOMING =====
   if (text || msg.message.imageMessage || msg.message.videoMessage) {
     const tag = isStatus ? '📸 STATUS' : isGroup ? '👥 GROUP' : '💬 DM';
     const preview = text.length > 60 ? text.slice(0, 60) + '...' : text;
     console.log(tag + ' [' + sender.split('@')[0] + '] ' + (fromMe ? '(me)' : '') + ': ' + (preview || '(media)'));
   }
 
-  // ===== STATUS REACT =====
+  // ===== STATUS AUTO-REACT =====
   if (isStatus) {
     sock.readMessages([msg.key]).catch(() => {});
     sock.sendMessage('status@broadcast',
@@ -127,7 +154,7 @@ async function handleMessage(sock, msg) {
     return;
   }
 
-  // ===== ACTIVITY =====
+  // ===== ACTIVITY TRACKING =====
   if (isGroup && !fromMe) {
     trackActivity(from, sender);
   }
@@ -143,9 +170,17 @@ async function handleMessage(sock, msg) {
     if (blocked) return;
   }
 
-  // ===== COMMAND =====
+  // ===== PUBLIC PAIRING (DM number → get code) =====
+  // Runs BEFORE command parser so a user can just send their number
+  if (!fromMe && text) {
+    const handled = await handlePublicPairRequest(sock, msg, from, sender, text);
+    if (handled) return;
+  }
+
+  // ===== COMMAND PARSER =====
   if (!text || !text.startsWith(PREFIX)) return;
 
+  // Owner-only enforcement
   if (!ownerIsSender) {
     console.log('🔒 Blocked: ' + sender + ' tried command');
     return;
@@ -157,7 +192,7 @@ async function handleMessage(sock, msg) {
 
   console.log('⚡ COMMAND: ' + command + ' args=' + JSON.stringify(args));
 
-  // Reaction
+  // React with random emoji
   sock.sendMessage(from, { react: { text: randomEmoji(), key: msg.key } }).catch(() => {});
 
   try {
@@ -169,28 +204,35 @@ async function handleMessage(sock, msg) {
   }
 }
 
+// ============================================================
+//  COMMAND ROUTER
+// ============================================================
 async function runCommand(sock, msg, from, command, args, isGroup) {
-  // GENERAL COMMANDS (work everywhere)
+
+  // ===== GENERAL COMMANDS (work everywhere) =====
   try {
     switch (command) {
-      case 'ping': return cmdPing(sock, msg, from);
-      case 'help': return cmdHelp(sock, msg, from);
-      case 'list': return cmdList(sock, msg, from);
-      case 'menu': return cmdMenu(sock, msg, from);
-      case 'dp': return cmdProfile(sock, msg, from);
+      case 'ping':    return cmdPing(sock, msg, from);
+      case 'help':    return cmdHelp(sock, msg, from);
+      case 'list':    return cmdList(sock, msg, from);
+      case 'menu':    return cmdMenu(sock, msg, from);
+      case 'dp':      return cmdProfile(sock, msg, from);
       case 'vv':
-      case 'save': return cmdViewOnce(sock, msg, from);
-      case 'send': return cmdSend(sock, msg, from);
+      case 'save':    return cmdViewOnce(sock, msg, from);
+      case 'send':    return cmdSend(sock, msg, from);
 
-      // Contact commands
+      // Public pairing (owner-issued)
+      case 'pair':    return cmdPair(sock, msg, from, args);
+
+      // Contact suite
       case 'contact': {
         const sub = (args[0] || '').toLowerCase();
-        if (sub === 'list') return cmdContactList(sock, msg, from, args.slice(1));
+        if (sub === 'list')   return cmdContactList(sock, msg, from, args.slice(1));
         if (sub === 'search') return cmdContactSearch(sock, msg, from, args.slice(1));
-        if (sub === 'save') return cmdContactSave(sock, msg, from, args.slice(1));
-        if (sub === 'del') return cmdContactDelete(sock, msg, from, args.slice(1));
+        if (sub === 'save')   return cmdContactSave(sock, msg, from, args.slice(1));
+        if (sub === 'del')    return cmdContactDelete(sock, msg, from, args.slice(1));
         if (sub === 'export') return cmdContactExport(sock, msg, from);
-        if (sub === 'autog') return cmdContactAutoGroup(sock, msg, from, args.slice(1));
+        if (sub === 'autog')  return cmdContactAutoGroup(sock, msg, from, args.slice(1));
         return cmdContactHelp(sock, msg, from);
       }
     }
@@ -199,7 +241,7 @@ async function runCommand(sock, msg, from, command, args, isGroup) {
     throw e;
   }
 
-  // GROUP-ONLY COMMANDS
+  // ===== GROUP-ONLY COMMANDS =====
   if (!isGroup) {
     await sock.sendMessage(from, { text: '⚠️ "' + command + '" is a group-only command.' });
     return;
@@ -207,19 +249,19 @@ async function runCommand(sock, msg, from, command, args, isGroup) {
 
   try {
     switch (command) {
-      case 'info': return cmdInfo(sock, msg, from);
-      case 'tagall': return cmdTagAll(sock, msg, from);
-      case 'kick': return cmdKick(sock, msg, from);
-      case 'promote': return cmdPromote(sock, msg, from);
-      case 'demote': return cmdDemote(sock, msg, from);
-      case 'subject': return cmdSubject(sock, msg, from, args);
-      case 'link': return cmdLink(sock, msg, from);
-      case 'antilink': return cmdAntilink(sock, msg, from, args);
-      case 'active': return cmdActive(sock, msg, from, args);
-      case 'inactive': return cmdInactive(sock, msg, from, args);
-      case 'resetactivity': return cmdResetActivity(sock, msg, from);
+      case 'info':           return cmdInfo(sock, msg, from);
+      case 'tagall':         return cmdTagAll(sock, msg, from);
+      case 'kick':           return cmdKick(sock, msg, from);
+      case 'promote':        return cmdPromote(sock, msg, from);
+      case 'demote':         return cmdDemote(sock, msg, from);
+      case 'subject':        return cmdSubject(sock, msg, from, args);
+      case 'link':           return cmdLink(sock, msg, from);
+      case 'antilink':       return cmdAntilink(sock, msg, from, args);
+      case 'active':         return cmdActive(sock, msg, from, args);
+      case 'inactive':       return cmdInactive(sock, msg, from, args);
+      case 'resetactivity':  return cmdResetActivity(sock, msg, from);
       case 'dk':
-      case 'domainking': return cmdDk(sock, msg, from, args);
+      case 'domainking':     return cmdDk(sock, msg, from, args);
       default:
         return sock.sendMessage(from, { text: '❓ Unknown: ' + command + '. Try ' + PREFIX + 'menu' });
     }
@@ -229,4 +271,17 @@ async function runCommand(sock, msg, from, command, args, isGroup) {
   }
 }
 
+// ============================================================
+//  GLOBAL CRASH GUARDS
+// ============================================================
+process.on('uncaughtException', (e) => {
+  console.error('🔥 uncaughtException:', e?.message || e);
+});
+process.on('unhandledRejection', (e) => {
+  console.error('🔥 unhandledRejection:', e?.message || e);
+});
+
+// ============================================================
+//  BOOT
+// ============================================================
 startBot();
