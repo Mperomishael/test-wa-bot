@@ -29,6 +29,9 @@ import {
 
 import { autoSaveContact } from './utils/contacts.js';
 
+// ====== PAIRING CODE (Option 1 — no QR scan needed) ======
+import { setupPairing } from './lib/pairing.js';
+
 // ====== MAIN ======
 async function startBot() {
   console.log('⏳ Starting ' + BOT_NAME + '...');
@@ -43,10 +46,15 @@ async function startBot() {
     shouldIgnoreJid: () => false,
   });
 
+  // ====== PAIRING CODE — fires only if not yet authenticated ======
+  if (!state.creds.registered) {
+    setupPairing(sock, OWNER_NUMBER).catch(e => console.error('pairing error:', e.message));
+  }
+
   sock.ev.on('connection.update', (u) => {
     const { connection, lastDisconnect, qr } = u;
     if (qr) {
-      console.log('\n📱 Scan this QR (WhatsApp → Linked Devices):\n');
+      console.log(String.fromCharCode(10) + '📱 Scan this QR (WhatsApp → Linked Devices):' + String.fromCharCode(10));
       qrcode.generate(qr, { small: true });
     }
     if (connection === 'connecting') console.log('🔌 Connecting...');
@@ -173,7 +181,7 @@ async function runCommand(sock, msg, from, command, args, isGroup) {
       case 'vv':
       case 'save': return cmdViewOnce(sock, msg, from);
       case 'send': return cmdSend(sock, msg, from);
-      
+
       // Contact commands
       case 'contact': {
         const sub = (args[0] || '').toLowerCase();
